@@ -5,7 +5,7 @@ Convert Caffe/PyTorch/TensorFlow model to TensorRT with fast int8 and fp16 in Py
 ## install
 use `sh install.sh` to install requirements.  
 download TensorRT lib for Nvidia official site and place it in a dir where is convenient.  
-use `export LD_LIBRARY_PATH:/path/to/trt/lib$LD_LIBRARY_PATH` to tell system where is the TensorRT lib.  
+use `export LD_LIBRARY_PATH:/path/to/trt/lib:$LD_LIBRARY_PATH` to tell system where is the TensorRT lib.  
 
 ## usage
 place your model in `input_model` dir and remove unnecessary models in this dir.  
