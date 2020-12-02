@@ -14,27 +14,276 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument('--fp16', action="store_true")
 parser.add_argument('--int8', action="store_true")
+
 parser.add_argument('--onnx', action="store_true")
 parser.add_argument('--caffe', action="store_true")
 parser.add_argument('--pb', action="store_true")
-parser.add_argument('--batchsize')
-parser.add_argument('--channel')
-parser.add_argument('--height')
-parser.add_argument('--width')
+parser.add_argument('--nchw')
 parser.add_argument('--dynamic', action="store_true")
+parser.add_argument('--cache', action="store_true")
 
 args = parser.parse_args()
 
-batch_size = int(args.batchsize)
-height = int(args.height)
-width = int(args.width)
-channel = int(args.channel)
+if not args.cache:
+    os.system("rm calibration.cache")
+
+[batch_size, channel, height, width] = list(map(int,args.nchw.split(",")))
+print("batchsize:", batch_size, " channel:", channel, " height:", height, " width:", width)
 
 NUM_BATCHES = 0
 NUM_PER_BATCH = 1
-NUM_CALIBRATION_IMAGES = 800
+NUM_CALIBRATION_IMAGES = 1000
+
+DIR_NAME = "./input_model"
+LIB_FILE = os.path.abspath(os.path.join(DIR_NAME, 'libflattenconcat.so'))
+MODEL_SPECS = {
+    'ssd_mobilenet_v1_coco': {
+        'input_pb':   os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v1_coco.pb')),
+        'tmp_uff':    os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v1_coco.uff')),
+        'output_bin': os.path.abspath(os.path.join(
+                          DIR_NAME, 'TRT_ssd_mobilenet_v1_coco.bin')),
+        'num_classes': 91,
+        'min_size': 0.2,
+        'max_size': 0.95,
+        'input_order': [0, 2, 1],  # order of loc_data, conf_data, priorbox_data
+    },
+    'ssd_mobilenet_v1_egohands': {
+        'input_pb':   os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v1_egohands.pb')),
+        'tmp_uff':    os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v1_egohands.uff')),
+        'output_bin': os.path.abspath(os.path.join(
+                          DIR_NAME, 'TRT_ssd_mobilenet_v1_egohands.bin')),
+        'num_classes': 2,
+        'min_size': 0.05,
+        'max_size': 0.95,
+        'input_order': [0, 2, 1],  # order of loc_data, conf_data, priorbox_data
+    },
+    'ssd_mobilenet_v2_coco': {
+        'input_pb':   os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v2_coco.pb')),
+        'tmp_uff':    os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v2_coco.uff')),
+        'output_bin': os.path.abspath(os.path.join(
+                          DIR_NAME, 'TRT_ssd_mobilenet_v2_coco.bin')),
+        'num_classes': 91,
+        'min_size': 0.2,
+        'max_size': 0.95,
+        'input_order': [1, 0, 2],  # order of loc_data, conf_data, priorbox_data
+    },
+    'ssd_mobilenet_v2_egohands': {
+        'input_pb':   os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v2_egohands.pb')),
+        'tmp_uff':    os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_mobilenet_v2_egohands.uff')),
+        'output_bin': os.path.abspath(os.path.join(
+                          DIR_NAME, 'TRT_ssd_mobilenet_v2_egohands.bin')),
+        'num_classes': 2,
+        'min_size': 0.05,
+        'max_size': 0.95,
+        'input_order': [0, 2, 1],  # order of loc_data, conf_data, priorbox_data
+    },
+    'ssd_inception_v2_coco': {
+        'input_pb':   os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_inception_v2_coco.pb')),
+        'tmp_uff':    os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssd_inception_v2_coco.uff')),
+        'output_bin': os.path.abspath(os.path.join(
+                          DIR_NAME, 'TRT_ssd_inception_v2_coco.bin')),
+        'num_classes': 91,
+        'min_size': 0.2,
+        'max_size': 0.95,
+        'input_order': [0, 2, 1],  # order of loc_data, conf_data, priorbox_data
+    },
+    'ssdlite_mobilenet_v2_coco': {
+        'input_pb':   os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssdlite_mobilenet_v2_coco.pb')),
+        'tmp_uff':    os.path.abspath(os.path.join(
+                          DIR_NAME, 'ssdlite_mobilenet_v2_coco.uff')),
+        'output_bin': os.path.abspath(os.path.join(
+                          DIR_NAME, 'TRT_ssdlite_mobilenet_v2_coco.bin')),
+        'num_classes': 91,
+        'min_size': 0.2,
+        'max_size': 0.95,
+        'input_order': [0, 2, 1],  # order of loc_data, conf_data, priorbox_data
+    },
+}
+
+def prepare_namespace_plugin_map():
+    # plugin 替换
+    resize = gs.create_plugin_node(name="trt_resize", op="ResizeNearest_TRT", scale=2.0)
+    namespace_plugin_map = {
+        "resize_1/ResizeBilinear": resize
+    }
+    return namespace_plugin_map
+
+def replace_addv2(graph):
+    """Replace all 'AddV2' in the graph with 'Add'.
+
+    'AddV2' is not supported by UFF parser.
+
+    Reference:
+    1. https://github.com/jkjung-avt/tensorrt_demos/issues/113#issuecomment-629900809
+    """
+    for node in graph.find_nodes_by_op('AddV2'):
+        gs.update_node(node, op='Add')
+    return graph
+
+def replace_fusedbnv3(graph):
+    """Replace all 'FusedBatchNormV3' in the graph with 'FusedBatchNorm'.
+
+    'FusedBatchNormV3' is not supported by UFF parser.
+
+    Reference:
+    1. https://devtalk.nvidia.com/default/topic/1066445/tensorrt/tensorrt-6-0-1-tensorflow-1-14-no-conversion-function-registered-for-layer-fusedbatchnormv3-yet/post/5403567/#5403567
+    2. https://github.com/jkjung-avt/tensorrt_demos/issues/76#issuecomment-607879831
+    """
+    for node in graph.find_nodes_by_op('FusedBatchNormV3'):
+        gs.update_node(node, op='FusedBatchNorm')
+    return graph
+
+def add_anchor_input(graph):
+    """Add the missing const input for the GridAnchor node.
+
+    Reference:
+    1. https://www.minds.ai/post/deploying-ssd-mobilenet-v2-on-the-nvidia-jetson-and-nano-platforms
+    """
+    data = np.array([1, 1], dtype=np.float32)
+    anchor_input = gs.create_node('AnchorInput', 'Const', value=data)
+    graph.append(anchor_input)
+    graph.find_nodes_by_op('GridAnchor_TRT')[0].input.insert(0, 'AnchorInput')
+    return graph
+
+def add_plugin(graph, model, spec):
+    """add_plugin
+
+    Reference:
+    1. https://github.com/AastaNV/TRT_object_detection/blob/master/config/model_ssd_mobilenet_v1_coco_2018_01_28.py
+    2. https://github.com/AastaNV/TRT_object_detection/blob/master/config/model_ssd_mobilenet_v2_coco_2018_03_29.py
+    3. https://devtalk.nvidia.com/default/topic/1050465/jetson-nano/how-to-write-config-py-for-converting-ssd-mobilenetv2-to-uff-format/post/5333033/#5333033
+    """
+    numClasses = spec['num_classes']
+    minSize = spec['min_size']
+    maxSize = spec['max_size']
+    inputOrder = spec['input_order']
+
+    all_assert_nodes = graph.find_nodes_by_op('Assert')
+    graph.remove(all_assert_nodes, remove_exclusive_dependencies=True)
+
+    all_identity_nodes = graph.find_nodes_by_op('Identity')
+    graph.forward_inputs(all_identity_nodes)
+    INPUT_DIMS = (3, 300, 300)
+    Input = gs.create_plugin_node(
+        name='Input',
+        op='Placeholder',
+        shape=(1,) + INPUT_DIMS
+    )
+
+    PriorBox = gs.create_plugin_node(
+        name='MultipleGridAnchorGenerator',
+        op='GridAnchor_TRT',
+        minSize=minSize,  # was 0.2
+        maxSize=maxSize,  # was 0.95
+        aspectRatios=[1.0, 2.0, 0.5, 3.0, 0.33],
+        variance=[0.1, 0.1, 0.2, 0.2],
+        featureMapShapes=[19, 10, 5, 3, 2, 1],
+        numLayers=6
+    )
+
+    NMS = gs.create_plugin_node(
+        name='NMS',
+        op='NMS_TRT',
+        shareLocation=1,
+        varianceEncodedInTarget=0,
+        backgroundLabelId=0,
+        confidenceThreshold=0.3,  # was 1e-8
+        nmsThreshold=0.6,
+        topK=100,
+        keepTopK=100,
+        numClasses=numClasses,  # was 91
+        inputOrder=inputOrder,
+        confSigmoid=1,
+        isNormalized=1
+    )
+
+    concat_priorbox = gs.create_node(
+        'concat_priorbox',
+        op='ConcatV2',
+        axis=2
+    )
+
+    if trt.__version__[0] >= '7':
+        concat_box_loc = gs.create_plugin_node(
+            'concat_box_loc',
+            op='FlattenConcat_TRT',
+            axis=1,
+            ignoreBatch=0
+        )
+        concat_box_conf = gs.create_plugin_node(
+            'concat_box_conf',
+            op='FlattenConcat_TRT',
+            axis=1,
+            ignoreBatch=0
+        )
+    else:
+        concat_box_loc = gs.create_plugin_node(
+            'concat_box_loc',
+            op='FlattenConcat_TRT'
+        )
+        concat_box_conf = gs.create_plugin_node(
+            'concat_box_conf',
+            op='FlattenConcat_TRT'
+        )
+
+    namespace_for_removal = [
+        'ToFloat',
+        'image_tensor',
+        'Preprocessor/map/TensorArrayStack_1/TensorArrayGatherV3',
+    ]
+    namespace_plugin_map = {
+        'MultipleGridAnchorGenerator': PriorBox,
+        'Postprocessor': NMS,
+        'Preprocessor': Input,
+        'ToFloat': Input,
+        'Cast': Input,  # added for models trained with tf 1.15+
+        'image_tensor': Input,
+        'MultipleGridAnchorGenerator/Concatenate': concat_priorbox,  # for 'ssd_mobilenet_v1_coco'
+        'Concatenate': concat_priorbox,  # for other models
+        'concat': concat_box_loc,
+        'concat_1': concat_box_conf
+    }
+
+    graph.remove(graph.find_nodes_by_path(['Preprocessor/map/TensorArrayStack_1/TensorArrayGatherV3']), remove_exclusive_dependencies=False)  # for 'ssd_inception_v2_coco'
+
+    graph.collapse_namespaces(namespace_plugin_map)
+    graph = replace_addv2(graph)
+    graph = replace_fusedbnv3(graph)
+
+    if 'image_tensor:0' in graph.find_nodes_by_name('Input')[0].input:
+        graph.find_nodes_by_name('Input')[0].input.remove('image_tensor:0')
+    if 'Input' in graph.find_nodes_by_name('NMS')[0].input:
+        graph.find_nodes_by_name('NMS')[0].input.remove('Input')
+    # Remove the Squeeze to avoid "Assertion 'isPlugin(layerName)' failed"
+    graph.forward_inputs(graph.find_node_inputs_by_name(graph.graph_outputs[0], 'Squeeze'))
+    if 'anchors' in [node.name for node in graph.graph_outputs]:
+        graph.remove('anchors', remove_exclusive_dependencies=False)
+    if len(graph.find_nodes_by_op('GridAnchor_TRT')[0].input) < 1:
+        graph = add_anchor_input(graph)
+    if 'NMS' not in [node.name for node in graph.graph_outputs]:
+        graph.remove(graph.graph_outputs, remove_exclusive_dependencies=False)
+        # if 'NMS' not in [node.name for node in graph.graph_outputs]:
+        #     # We expect 'NMS' to be one of the outputs
+        #     raise RuntimeError('bad graph_outputs')
+
+    return graph
 
 def preprocess(image):
+    """ 预处理代码。
+
+    设置均值、方差、转置等操作。
+    """
     data = cv2.imread(image)
     data = cv2.resize(data, (224, 224))/ 255.
     mean = np.array([0.485, 0.456, 0.406])
@@ -43,10 +292,10 @@ def preprocess(image):
     data = np.transpose(data, (2, 0, 1))
     return data 
 
-# load_data 读取数据。
-# 不同的模型需要根据其数据预处理进行修改。
 def load_data(data_dir):
-    
+    """ load_data 读取数据。
+        不同的模型需要根据其数据预处理进行修改。      
+    """
     imgs = glob.glob(data_dir+'/*.jpg')
     NUM_BATCHES = NUM_CALIBRATION_IMAGES // NUM_PER_BATCH + (NUM_CALIBRATION_IMAGES % NUM_PER_BATCH > 0)
     print("NUM_BATCHES: ", NUM_BATCHES)
@@ -61,8 +310,10 @@ def load_data(data_dir):
         batches[i] = batch
     return batches
 
-# Int8EntropyCalibrator 类
+
 class Int8EntropyCalibrator(trt.IInt8EntropyCalibrator2):
+    """Int8EntropyCalibrator 类
+    """
     def __init__(self, cache_file, batch_size):
         trt.IInt8EntropyCalibrator2.__init__(self)
         self.cache_file = cache_file
@@ -102,13 +353,6 @@ class Int8EntropyCalibrator(trt.IInt8EntropyCalibrator2):
         with open(self.cache_file, "wb") as f:
             f.write(cache)
 
-def prepare_namespace_plugin_map():
-    # plugin 替换
-    resize = gs.create_plugin_node(name="trt_resize", op="ResizeNearest_TRT", scale=2.0)
-    namespace_plugin_map = {
-        "resize_1/ResizeBilinear": resize
-    }
-    return namespace_plugin_map
 
 def build_engine():
     TRT_LOGGER = trt.Logger()
@@ -153,30 +397,29 @@ def build_engine():
 
     # PB 模型转换
     elif args.pb:
+        trt.init_libnvinfer_plugins(TRT_LOGGER, '')
         network = builder.create_network()
         parser = trt.UffParser()
 
         model_path = os.listdir("./input_model")[0]
         model_file = os.path.join('./input_model',model_path)
 
-        dynamic_graph = gs.DynamicGraph(model_file)
-        dynamic_graph.collapse_namespaces(prepare_namespace_plugin_map())
-        # Save resulting graph to UFF file
-        output_uff_path = os.path.splitext(model_file)[0] + ".uff"
-        uff.from_tensorflow(
+        spec = MODEL_SPECS[model_path.split(".")[0]]
+        dynamic_graph = add_plugin(
+            gs.DynamicGraph(model_file),
+            model_path.split(".")[0],
+            spec)
+        _ = uff.from_tensorflow(
             dynamic_graph.as_graph_def(),
-            ["scores"],
-            output_filename=os.path.join('./input_model',output_uff_path),
-            text=True
-        )
-        parser.register_input("tf_example",(batch_size,channel,height,width))
-        parser.register_output("scores")
-        model_file = os.path.join('./input_model',output_uff_path)
-        parser.parse(model_file, network)
-
-        last_layer = network.get_layer(network.num_layers - 1)
-        if not last_layer.get_output(0):
-            network.mark_output(last_layer.get_output(0))
+            output_nodes=['NMS'],
+            output_filename=spec['tmp_uff'],
+            text=True,
+            debug_mode=False)
+        parser.register_input("Input",(channel,height,width))
+        parser.register_output("MarkOutput_0")
+        parser.parse(spec['tmp_uff'], network)
+        os.system("rm ./input_model/*.pbtxt")
+        os.system("rm ./input_model/*.uff")
         
     # 不支持模型类型
     else:
@@ -185,6 +428,7 @@ def build_engine():
 
 
     config = builder.create_builder_config()
+    config.max_workspace_size = common.GiB(5)
     if args.dynamic:
         print("Dynamic model setting optimization profile")
         profile = builder.create_optimization_profile()
@@ -192,7 +436,7 @@ def build_engine():
         config.add_optimization_profile(profile)
 
     builder.max_batch_size = batch_size
-    builder.max_workspace_size = common.GiB(5)
+    # builder.max_workspace_size = common.GiB(5)
     if args.int8:
         if builder.platform_has_fast_int8:
             print("Convert in INT8 mode.")
@@ -226,6 +470,7 @@ def build_engine():
         print('Saving TRT engine file to path {}...'.format(trt_engine_name))
         with open(os.path.join('./output_trt_models',trt_engine_name), "wb") as f:
             f.write(engine.serialize())
+            print(bytes(engine.serialize()).__sizeof__)
             # f.write(sys.getsizeof(engine.serialize()))
         print('Engine file has already saved to {}!'.format(trt_engine_name))
     else:
@@ -245,7 +490,7 @@ def main():
     image_data = image_data.ravel().astype(np.float32)
     print("Test image shape:", image_data.shape)
     inputs[0].host = image_data
-    if args.caffe:
+    if args.caffe or args.pb:
         trt_outputs = common.do_inference(context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream)
     else:
         trt_outputs = common.do_inference_v2(context, bindings=bindings, inputs=inputs, outputs=outputs, stream=stream)
@@ -253,5 +498,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-    
