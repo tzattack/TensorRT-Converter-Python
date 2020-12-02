@@ -28,5 +28,5 @@ Use `python3 trtconvert.py --onnx --nchw 32,3,300,300 --dynamic --int8` to conve
 
 
 ## Known issues
-- Accuracy descends when converting a model with depthwise convolution on Turing Graphic cards.
+- Accuracy descends when converting a model with depthwise convolution on Turing Architecture Graphic cards(etc. GTX 2080).
 - Low chances for converting a tf model.
